@@ -3,6 +3,8 @@ from pathlib import Path
 import cv2
 import torch
 import numpy as np
+import os
+import json
 
 from lightglue import LightGlue, SuperPoint
 from lightglue.utils import load_image, rbd
@@ -127,12 +129,52 @@ def main():
     # Warp production image to match original image
     warped_prod = cv2.warpPerspective(prod_img, M, (w, h))
 
+    # Create tmp_output directory
+    output_dir = Path("tmp_output")
+    output_dir.mkdir(exist_ok=True)
+    
     # Create overlay
     overlay = cv2.addWeighted(orig_img, args.alpha_orig, warped_prod, args.alpha_prod, 0)
 
-    output_path = "overlay.jpg"
-    cv2.imwrite(output_path, overlay)
+    # Save overlay.jpg
+    output_path = output_dir / "overlay.jpg"
+    cv2.imwrite(str(output_path), overlay)
     print(f"\n✓ Overlay saved to {output_path}")
+    
+    # Create prod_transformed.png (only transformed prod, orig is transparent)
+    # Convert warped_prod to RGBA
+    warped_prod_rgba = cv2.cvtColor(warped_prod, cv2.COLOR_BGR2BGRA)
+    
+    # Create a mask where non-black pixels in warped_prod are opaque
+    # (black pixels indicate areas outside the warped image)
+    gray = cv2.cvtColor(warped_prod, cv2.COLOR_BGR2GRAY)
+    _, alpha_mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+    warped_prod_rgba[:, :, 3] = alpha_mask
+    
+    prod_transformed_path = output_dir / "prod_transformed.png"
+    cv2.imwrite(str(prod_transformed_path), warped_prod_rgba)
+    print(f"✓ Transformed production image saved to {prod_transformed_path}")
+    
+    # Save transformation info to JSON
+    transformation_info = {
+        "homography_matrix": M.tolist(),
+        "num_inliers": int(num_inliers),
+        "used_flipped": use_flipped,
+        "alpha_orig": args.alpha_orig,
+        "alpha_prod": args.alpha_prod,
+        "orig_image": str(image0_path),
+        "prod_image": str(image1_path),
+        "orig_dimensions": {"width": w, "height": h},
+        "inliers_comparison": {
+            "original": num_inliers_orig,
+            "flipped": num_inliers_flipped
+        }
+    }
+    
+    json_path = output_dir / "transformation.json"
+    with open(json_path, 'w') as f:
+        json.dump(transformation_info, f, indent=2)
+    print(f"✓ Transformation data saved to {json_path}")
 
 if __name__ == "__main__":
     main()
