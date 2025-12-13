@@ -1,0 +1,186 @@
+"""Core logic for match_and_overlay function."""
+from pathlib import Path
+import cv2
+import torch
+import numpy as np
+import json
+
+from lightglue import LightGlue, SuperPoint, load_image, rbd
+from ..versioning import get_versioning_info
+
+
+def process_image_pair(extractor, matcher, image0, image1, device):
+    """
+    Process a pair of images and return match quality metrics.
+    
+    Returns:
+        tuple: (num_inliers, homography_matrix, mkpts0, mkpts1)
+    """
+    # Match images
+    feats0 = extractor.extract(image0)
+    feats1 = extractor.extract(image1)
+    matches01 = matcher({"image0": feats0, "image1": feats1})
+    
+    feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]
+
+    kpts0 = feats0["keypoints"]
+    kpts1 = feats1["keypoints"]
+    matches = matches01["matches"]
+    
+    # Get matched keypoints
+    mkpts0 = kpts0[matches[..., 0]].cpu().numpy()
+    mkpts1 = kpts1[matches[..., 1]].cpu().numpy()
+
+    num_matches = len(mkpts0)
+    
+    if num_matches < 4:
+        return 0, None, mkpts0, mkpts1
+
+    # Compute Homography: prod (image1) -> orig (image0)
+    M, mask = cv2.findHomography(mkpts1, mkpts0, cv2.RANSAC, 5.0)
+    
+    # Count inliers (mask contains 1 for inliers, 0 for outliers)
+    num_inliers = int(np.sum(mask)) if mask is not None else 0
+
+    return num_inliers, M, mkpts0, mkpts1
+
+
+def main():
+    import argparse
+    from . import __version__
+    
+    parser = argparse.ArgumentParser(description='LightGlue Match and Overlay')
+    parser.add_argument('orig', type=str, help='Path to original (background) image')
+    parser.add_argument('prod', type=str, help='Path to production (foreground) image')
+    parser.add_argument('--alpha_orig', type=float, default=0.5, help='Transparency for original image')
+    parser.add_argument('--alpha_prod', type=float, default=0.5, help='Transparency for production image')
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on {device}")
+
+    # Load extractor and matcher
+    extractor = SuperPoint(max_num_keypoints=2048).eval().to(device)
+    matcher = LightGlue(features="superpoint").eval().to(device)
+
+    # Load images
+    image0_path = Path(args.orig)
+    image1_path = Path(args.prod)
+
+    if not image0_path.exists():
+        print(f"Error: File {args.orig} not found.")
+        return
+    if not image1_path.exists():
+        print(f"Error: File {args.prod} not found.")
+        return
+
+    # Load original image as tensor
+    image0 = load_image(image0_path).to(device)
+    
+    # Load production image as tensor
+    image1 = load_image(image1_path).to(device)
+    
+    # Create flipped version (horizontal flip)
+    # For tensor: flip along width dimension (dim=-1)
+    image1_flipped = torch.flip(image1, dims=[-1])
+
+    print("\n=== Testing Original Production Image ===")
+    num_inliers_orig, M_orig, mkpts0_orig, mkpts1_orig = process_image_pair(
+        extractor, matcher, image0, image1, device
+    )
+    print(f"Matches found: {len(mkpts0_orig)}")
+    print(f"RANSAC inliers: {num_inliers_orig}")
+    
+    print("\n=== Testing Flipped Production Image ===")
+    num_inliers_flipped, M_flipped, mkpts0_flipped, mkpts1_flipped = process_image_pair(
+        extractor, matcher, image0, image1_flipped, device
+    )
+    print(f"Matches found: {len(mkpts0_flipped)}")
+    print(f"RANSAC inliers: {num_inliers_flipped}")
+    
+    # Select best match
+    print("\n=== Match Quality Comparison ===")
+    if num_inliers_orig > num_inliers_flipped:
+        print(f"✓ Best match: ORIGINAL (inliers: {num_inliers_orig} vs {num_inliers_flipped})")
+        use_flipped = False
+        M = M_orig
+        num_inliers = num_inliers_orig
+    else:
+        print(f"✓ Best match: FLIPPED (inliers: {num_inliers_flipped} vs {num_inliers_orig})")
+        use_flipped = True
+        M = M_flipped
+        num_inliers = num_inliers_flipped
+    
+    if num_inliers == 0:
+        print("Error: Not enough matches to compute homography.")
+        return
+
+    print(f"Certainty: {num_inliers} inliers")
+    
+    print("\n=== Homographic Transformation Matrix ===")
+    print(M)
+
+    # Load images as numpy arrays for overlay
+    orig_img = cv2.imread(str(image0_path))
+    prod_img = cv2.imread(str(image1_path))
+    
+    # Flip if necessary
+    if use_flipped:
+        prod_img = cv2.flip(prod_img, 1)  # Horizontal flip
+
+    h, w = orig_img.shape[:2]
+
+    # Warp production image to match original image
+    warped_prod = cv2.warpPerspective(prod_img, M, (w, h))
+
+    # Create tmp_output directory
+    output_dir = Path("tmp_output")
+    output_dir.mkdir(exist_ok=True)
+    
+    # Create overlay
+    overlay = cv2.addWeighted(orig_img, args.alpha_orig, warped_prod, args.alpha_prod, 0)
+
+    # Save overlay.jpg
+    output_path = output_dir / "overlay.jpg"
+    cv2.imwrite(str(output_path), overlay)
+    print(f"\n✓ Overlay saved to {output_path}")
+    
+    # Create prod_transformed.png (only transformed prod, orig is transparent)
+    # Convert warped_prod to RGBA
+    warped_prod_rgba = cv2.cvtColor(warped_prod, cv2.COLOR_BGR2BGRA)
+    
+    # Create a mask where non-black pixels in warped_prod are opaque
+    # (black pixels indicate areas outside the warped image)
+    gray = cv2.cvtColor(warped_prod, cv2.COLOR_BGR2GRAY)
+    _, alpha_mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+    warped_prod_rgba[:, :, 3] = alpha_mask
+    
+    prod_transformed_path = output_dir / "prod_transformed.png"
+    cv2.imwrite(str(prod_transformed_path), warped_prod_rgba)
+    print(f"✓ Transformed production image saved to {prod_transformed_path}")
+    
+    # Get versioning information
+    versioning_info = get_versioning_info(__version__)
+    
+    # Save transformation info to JSON
+    transformation_info = {
+        "versioning": versioning_info,
+        "homography_matrix": M.tolist(),
+        "num_inliers": int(num_inliers),
+        "used_flipped": use_flipped,
+        "alpha_orig": args.alpha_orig,
+        "alpha_prod": args.alpha_prod,
+        "orig_image": str(image0_path),
+        "prod_image": str(image1_path),
+        "orig_dimensions": {"width": w, "height": h},
+        "inliers_comparison": {
+            "original": num_inliers_orig,
+            "flipped": num_inliers_flipped
+        }
+    }
+    
+    json_path = output_dir / "transformation.json"
+    with open(json_path, 'w') as f:
+        json.dump(transformation_info, f, indent=2)
+    print(f"✓ Transformation data saved to {json_path}")
+
